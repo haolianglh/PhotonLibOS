@@ -51,5 +51,8 @@ int run_fuse(int argc, char *argv[], const struct fuse_operations *op,
 int run_fuse_ll(int argc, char *argv[], const struct fuse_lowlevel_ops *llop,
     void *user_data);
 
+int run_fuse_ll(struct fuse_args *pargs, const struct fuse_lowlevel_ops *llop,
+    void *user_data);
+
 }
 }

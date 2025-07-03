@@ -1,47 +1,29 @@
-/*
-  FUSE: Filesystem in Userspace
-  Copyright (C) 2001-2007  Miklos Szeredi <miklos@szeredi.hu>
 
-  This program can be distributed under the terms of the GNU GPLv2.
-  See the file COPYING.
-*/
-
-/** @file
- *
- * This file system mirrors the existing file system hierarchy of the
- * system, starting at the root file system. This is implemented by
- * just "passing through" all requests to the corresponding user-space
- * libc functions. In contrast to passthrough.c and passthrough_fh.c,
- * this implementation uses the low-level API. Its performance should
- * be the least bad among the three, but many operations are not
- * implemented. In particular, it is not possible to remove files (or
- * directories) because the code necessary to defer actual removal
- * until the file is not opened anymore would make the example much
- * more complicated.
- *
- * When writeback caching is enabled (-o writeback mount option), it
- * is only possible to write to files for which the mounting user has
- * read permissions. This is because the writeback cache requires the
- * kernel to be able to issue read requests for all files (which the
- * passthrough filesystem cannot satisfy if it can't read the file in
- * the underlying filesystem).
- *
- * Compile with:
- *
- *     gcc -Wall passthrough_ll.c `pkg-config fuse3 --cflags --libs` -o passthrough_ll
- *
- * ## Source code ##
- * \include passthrough_ll.c
- */
-
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #define FUSE_USE_VERSION 317
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #include <cstdio>
 #include <thread>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <limits.h>
+#include <dirent.h>
+#include <assert.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <sys/file.h>
+#include <sys/xattr.h>
 
 #ifndef FUSE_USE_VERSION
 #define FUSE_USE_VERSION 317
@@ -62,36 +44,7 @@
 
 using namespace photon;
 
-#include <fuse_lowlevel.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <stddef.h>
-#include <stdbool.h>
-#include <string.h>
-#include <limits.h>
-#include <dirent.h>
-#include <assert.h>
-#include <errno.h>
-#include <inttypes.h>
-#include <pthread.h>
-#include <sys/file.h>
-#include <sys/xattr.h>
-
 #include "passthrough_helpers.h"
-
-/* We are re-using pointers to our `struct lo_inode` and `struct
-   lo_dirp` elements as inodes. This means that we must be able to
-   store uintptr_t values in a fuse_ino_t variable. The following
-   incantation checks this condition at compile time. */
-#if defined(__GNUC__) && (__GNUC__ > 4 || __GNUC__ == 4 && __GNUC_MINOR__ >= 6) && !defined __cplusplus
-_Static_assert(sizeof(fuse_ino_t) >= sizeof(uintptr_t),
-	       "fuse_ino_t too small to hold uintptr_t values!");
-#else
-struct _uintptr_to_must_hold_fuse_ino_t_dummy_struct \
-	{ unsigned _uintptr_to_must_hold_fuse_ino_t:
-			((sizeof(fuse_ino_t) >= sizeof(uintptr_t)) ? 1 : -1); };
-#endif
 
 struct lo_inode {
 	struct lo_inode *next; /* protected by lo->mutex */
@@ -149,7 +102,7 @@ static const struct fuse_opt lo_opts[] = {
 
 	FUSE_OPT_END
 };
-
+/*
 static void passthrough_ll_help(void)
 {
 	printf(
@@ -166,7 +119,7 @@ static void passthrough_ll_help(void)
 "    -o cache=auto          Auto enable cache\n"
 "    -o cache=always        Cache always\n");
 }
-
+*/
 static struct lo_data *lo_data(fuse_req_t req)
 {
 	return (struct lo_data *) fuse_req_userdata(req);
@@ -234,7 +187,6 @@ static void lo_getattr(fuse_req_t req, fuse_ino_t ino,
 	int fd = fi ? fi->fh : lo_fd(req, ino);
 
 	(void) fi;
-
 	res = fstatat(fd, "", &buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		return (void) fuse_reply_err(req, errno);
@@ -341,7 +293,7 @@ static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, str
 	struct lo_inode *inode = NULL;
 	struct lo_inode *prev, *next;
 	
-	inode = calloc(1, sizeof(struct lo_inode));
+	inode = (struct lo_inode *)(calloc(1, sizeof(struct lo_inode)));
 	if (!inode)
 		return NULL;
 
@@ -621,7 +573,7 @@ static void lo_forget_multi(fuse_req_t req, size_t count,
 {
 	int i;
 
-	for (i = 0; i < count; i++)
+	for (i = 0; i < (int)count; i++)
 		lo_forget_one(req, forgets[i].ino, forgets[i].nlookup);
 	fuse_reply_none(req);
 }
@@ -661,7 +613,7 @@ static void lo_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
 	struct lo_dirp *d;
 	int fd = -1;
 
-	d = calloc(1, sizeof(struct lo_dirp));
+	d = (struct lo_dirp*)calloc(1, sizeof(struct lo_dirp));
 	if (d == NULL)
 		goto out_err;
 
@@ -712,7 +664,7 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 
 	(void) ino;
 
-	buf = calloc(1, size);
+	buf = (char *)calloc(1, size);
 	if (!buf) {
 		err = ENOMEM;
 		goto error;
@@ -747,10 +699,8 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 		if (plus) {
 			struct fuse_entry_param e;
 			if (is_dot_or_dotdot(name)) {
-				e = (struct fuse_entry_param) {
-					.attr.st_ino = d->entry->d_ino,
-					.attr.st_mode = d->entry->d_type << 12,
-				};
+				e.attr.st_ino = d->entry->d_ino;
+				e.attr.st_mode = d->entry->d_type << 12;
 			} else {
 				err = lo_do_lookup(req, ino, name, &e);
 				if (err)
@@ -763,7 +713,7 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 		} else {
 			struct stat st = {
 				.st_ino = d->entry->d_ino,
-				.st_mode = d->entry->d_type << 12,
+				.st_mode = (unsigned int)(d->entry->d_type << 12),
 			};
 			entsize = fuse_add_direntry(req, p, rem, name,
 						    &st, nextoff);
@@ -986,13 +936,25 @@ static void lo_read(fuse_req_t req, fuse_ino_t ino, size_t size,
 		fuse_log(FUSE_LOG_DEBUG, "lo_read(ino=%" PRIu64 ", size=%zd, "
 			"off=%lu)\n", ino, size, (unsigned long) offset);
 
-	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+	buf.buf[0].flags = (fuse_buf_flags)(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
 	buf.buf[0].fd = fi->fh;
 	buf.buf[0].pos = offset;
 
 	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
 }
 
+static void lo_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
+                     size_t size, off_t off, struct fuse_file_info *fi) {
+  (void) ino;
+  int fd = fi->fh;
+  ssize_t res = pwrite(fd, buf, size, off);
+  if (res < 0)
+    fuse_reply_err(req, -res);
+  else
+    fuse_reply_write(req, (size_t) res);
+}
+
+#if 0
 static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 			 struct fuse_bufvec *in_buf, off_t off,
 			 struct fuse_file_info *fi)
@@ -1001,7 +963,7 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 	ssize_t res;
 	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
 
-	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+	out_buf.buf[0].flags = (fuse_buf_flags)(FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK);
 	out_buf.buf[0].fd = fi->fh;
 	out_buf.buf[0].pos = off;
 
@@ -1009,12 +971,13 @@ static void lo_write_buf(fuse_req_t req, fuse_ino_t ino,
 		fuse_log(FUSE_LOG_DEBUG, "lo_write(ino=%" PRIu64 ", size=%zd, off=%lu)\n",
 			ino, out_buf.buf[0].size, (unsigned long) off);
 
-	res = fuse_buf_copy(&out_buf, in_buf, 0);
+	res = fuse_buf_copy(&out_buf, in_buf, (fuse_buf_copy_flags)0);
 	if(res < 0)
 		fuse_reply_err(req, -res);
 	else
 		fuse_reply_write(req, (size_t) res);
 }
+#endif
 
 static void lo_statfs(fuse_req_t req, fuse_ino_t ino)
 {
@@ -1083,7 +1046,7 @@ static void lo_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 	sprintf(procname, "/proc/self/fd/%i", inode->fd);
 
 	if (size) {
-		value = malloc(size);
+		value = (char *)malloc(size);
 		if (!value)
 			goto out_err;
 
@@ -1133,7 +1096,7 @@ static void lo_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 	sprintf(procname, "/proc/self/fd/%i", inode->fd);
 
 	if (size) {
-		value = malloc(size);
+		value = (char *)malloc(size);
 		if (!value)
 			goto out_err;
 
@@ -1256,50 +1219,48 @@ static const struct fuse_lowlevel_ops lo_oper = {
 	.init		= lo_init,
 	.destroy	= lo_destroy,
 	.lookup		= lo_lookup,
-	.mkdir		= lo_mkdir,
-	.mknod		= lo_mknod,
-	.symlink	= lo_symlink,
-	.link		= lo_link,
-	.unlink		= lo_unlink,
-	.rmdir		= lo_rmdir,
-	.rename		= lo_rename,
 	.forget		= lo_forget,
-	.forget_multi	= lo_forget_multi,
 	.getattr	= lo_getattr,
 	.setattr	= lo_setattr,
 	.readlink	= lo_readlink,
+	.mknod		= lo_mknod,
+	.mkdir		= lo_mkdir,
+	.unlink		= lo_unlink,
+	.rmdir		= lo_rmdir,
+	.symlink	= lo_symlink,
+	.rename		= lo_rename,
+	.link		= lo_link,
+	.open		= lo_open,
+	.read		= lo_read,
+	.write		= lo_write,
+	.flush		= lo_flush,
+	.release	= lo_release,
+	.fsync		= lo_fsync,
 	.opendir	= lo_opendir,
 	.readdir	= lo_readdir,
-	.readdirplus	= lo_readdirplus,
 	.releasedir	= lo_releasedir,
 	.fsyncdir	= lo_fsyncdir,
-	.create		= lo_create,
-	.tmpfile	= lo_tmpfile,
-	.open		= lo_open,
-	.release	= lo_release,
-	.flush		= lo_flush,
-	.fsync		= lo_fsync,
-	.read		= lo_read,
-	.write_buf      = lo_write_buf,
 	.statfs		= lo_statfs,
-	.fallocate	= lo_fallocate,
-	.flock		= lo_flock,
+	.setxattr	= lo_setxattr,
 	.getxattr	= lo_getxattr,
 	.listxattr	= lo_listxattr,
-	.setxattr	= lo_setxattr,
 	.removexattr	= lo_removexattr,
+	.create		= lo_create,
+	// .write_buf      = lo_write_buf,
+	.forget_multi	= lo_forget_multi,
+	.flock		= lo_flock,
+	.fallocate	= lo_fallocate,
+	.readdirplus	= lo_readdirplus,
+	.lseek		= lo_lseek,
+	.tmpfile	= lo_tmpfile,
 #ifdef HAVE_COPY_FILE_RANGE
 	.copy_file_range = lo_copy_file_range,
 #endif
-	.lseek		= lo_lseek,
 };
 
 int main(int argc, char *argv[])
 {
 	struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
-	struct fuse_session *se;
-	struct fuse_cmdline_opts opts;
-	struct fuse_loop_config *config;
 	struct lo_data lo = { .debug = 0,
 	                      .writeback = 0 };
 
@@ -1316,7 +1277,7 @@ int main(int argc, char *argv[])
 	if (fuse_opt_parse(&args, &lo, lo_opts, NULL)== -1)
 		return 1;
 
-	lo.debug = opts.debug;
+	// lo.debug = opts.debug;
 	lo.root.refcount = 2;
 	if (lo.source) {
 		struct stat stat;
@@ -1367,7 +1328,7 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-    run_fuse_ll(argc, argv, lo_oper, NULL);
+  photon::fs::run_fuse_ll(&args, &lo_oper, &lo);
 
 	if (lo.root.fd >= 0)
 		close(lo.root.fd);
