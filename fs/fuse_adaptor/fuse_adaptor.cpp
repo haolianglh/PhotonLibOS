@@ -255,5 +255,156 @@ int run_fuse(int argc, char *argv[], const struct ::fuse_operations *op,
     return 0;
 }
 
+#if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 0)
+fuse_session* fuse3_setup_ll(struct fuse_args *pargs, const struct ::fuse_lowlevel_ops *llops,
+           size_t op_size, char **mountpoint, int *multithreaded, void *user_data)
+{
+    // struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct fuse_session *se;
+    struct fuse_cmdline_opts opts;
+    // int ret = 0;
+
+    if (fuse_parse_cmdline(pargs, &opts) != 0)
+        return NULL;
+    *mountpoint = opts.mountpoint;
+    *multithreaded = !opts.singlethread;
+    if (opts.show_version) {
+        fuse_lowlevel_version();
+        // ret = 0;
+        goto err_out1;
+    }
+
+    if (opts.show_help) {
+        if(pargs->argv[0][0] != '\0')
+            printf("usage: %s [options] <mountpoint>\n\n",
+                   pargs->argv[0]);
+        printf("FUSE options:\n");
+        fuse_cmdline_help();
+        fuse_lowlevel_help();
+        // ret = 0;
+        goto err_out1;
+    }
+
+    if (!opts.show_help &&
+        !opts.mountpoint) {
+        fprintf(stderr, "error: no mountpoint specified\n");
+        // ret = 1;
+        goto err_out1;
+    }
+
+    se = fuse_session_new(pargs, llops, op_size, user_data);
+    if (se == NULL) {
+        goto err_out1;
+    }
+
+    if (fuse_set_signal_handlers(se) != 0)
+        goto err_out2;
+
+    if (fuse_session_mount(se, opts.mountpoint) != 0) {
+        goto err_out3;
+    }
+
+    fuse_daemonize(opts.foreground);
+
+    return se;
+
+err_out3:
+    fuse_remove_signal_handlers(se);
+err_out2:
+    fuse_session_destroy(se);
+err_out1:
+    free(opts.mountpoint);
+    // fuse_opt_free_args(&args);
+    return NULL;
+}
+
+fuse_session* fuse3_setup_ll(int argc, char *argv[], const struct ::fuse_lowlevel_ops *llops,
+           size_t op_size, char **mountpoint, int *multithreaded, void *user_data)
+{
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    fuse_session* se = fuse3_setup_ll(&args, llops, op_size, mountpoint, multithreaded, user_data);
+    if (!se) {
+        fuse_opt_free_args(&args);
+    }
+    return se;
+}
+
+#endif
+
+int run_fuse_ll(int argc, char *argv[], const struct ::fuse_lowlevel_ops *llops,
+             void *user_data) {
+    struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    int ret = run_fuse_ll(&args, llops, user_data);
+    fuse_opt_free_args(&args);
+    return ret;
+}
+
+int run_fuse_ll(struct fuse_args *pargs, const struct ::fuse_lowlevel_ops *llop,
+             void *user_data) {
+    // struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
+    struct user_config cfg{ .threads = 4, .looptype = NULL };
+    uint64_t looptype = FUSE_SESSION_LOOP_EPOLL;
+    fuse_opt_parse(pargs, &cfg, user_opts, NULL);
+
+    if (cfg.looptype)
+        looptype = find_looptype(cfg.looptype);
+#if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 13)
+    looptype = FUSE_SESSION_LOOP_EPOLL;
+#endif
+    LOG_INFO("session cfg loop type: `", VALUE(cfg.looptype), " loop type: `", VALUE(looptype));
+
+    struct fuse_session* se;
+    char *mountpoint;
+    int multithreaded;
+    int res;
+    size_t op_size = sizeof(*(llop));
+
+#if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 0)
+    // fuse = fuse_setup(args.argc, args.argv, op, op_size, &mountpoint, &multithreaded, user_data);
+#else
+    // se = fuse3_setup_ll(args.argc, args.argv, llop, op_size, &mountpoint, &multithreaded, user_data);
+    se = fuse3_setup_ll(pargs, llop, op_size, &mountpoint, &multithreaded, user_data);
+#endif
+    if (se == NULL) return 1;
+
+#if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 13)
+    if (looptype == FUSE_SESSION_LOOP_SYNC) {
+        set_sync_custom_io(se);
+    } else if (looptype == FUSE_SESSION_LOOP_IOURING_CASCADING) {
+        set_iouring_custom_io(se);
+    }
+#endif
+
+    if (multithreaded) {
+        if (cfg.threads < 1) cfg.threads = 1;
+        if (cfg.threads > 64) cfg.threads = 64;
+
+	std::vector<std::thread> ths;
+        for (int i = 0; i < cfg.threads; ++i) {
+          ths.emplace_back(std::thread([&]() {
+              init(INIT_EVENT_EPOLL, INIT_IO_LIBAIO);
+              DEFER(fini());
+              if (fuse_session_loop_mpt(se, looptype) != 0) res = -1;
+          }));
+        }
+        for (auto& th : ths) th.join();
+        fuse_session_reset(se);
+    } else {
+        res = fuse_session_loop_mpt(se);
+        fuse_session_reset(se);
+    }
+    fuse_remove_signal_handlers(se);
+#if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 0)
+    //cfuse_unmount(mountpoint, fuse_session_next_chan(se, NULL));
+#else
+    fuse_session_unmount(se);
+#endif
+    fuse_session_destroy(se);
+    free(mountpoint);
+    // fuse_opt_free_args(&args);
+    if (res == -1) return 1;
+
+    return 0;
+}
 }  // namespace fs
 }  // namespace photon
