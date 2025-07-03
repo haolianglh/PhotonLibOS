@@ -47,5 +47,9 @@ fuse_operations* get_fuse_xmp_oper();
 
 int run_fuse(int argc, char *argv[], const struct fuse_operations *op,
     void *user_data);
+
+int run_fuse_ll(int argc, char *argv[], const struct fuse_lowlevel_ops *llop,
+    void *user_data);
+
 }
 }
