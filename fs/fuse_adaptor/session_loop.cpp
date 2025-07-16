@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #include "session_loop.h"
+#include "fuse_pipe.h"
 
 #if FUSE_USE_VERSION >= 30
 #include <fuse3/fuse_lowlevel.h>
@@ -202,6 +203,7 @@ FuseSessionLoop* new_epoll_session_loop(struct fuse_session *se) {
 #define FUSE_DEV_IOC_CLONE  _IOR(FUSE_DEV_IOC_MAGIC, 0, uint32_t)
 
 static photon::thread_local_ptr<int> iofd;
+static photon::thread_local_ptr<struct fuse_pipe> iopipe;
 
 static ssize_t custom_writev(int fd, struct iovec *iov, int count, void *userdata)
 {
@@ -216,11 +218,22 @@ static ssize_t custom_read(int fd, void *buf, size_t len, void *userdata)
     return read(*iofd, buf, len);
 }
 
-template <typename ...Args>
-class WorkerArgs {
-public:
-    std::tuple<Args...> args;
-};
+static ssize_t custom_splice_receive(
+    int fdin, off_t *offin,
+    int fdout, off_t *offout, size_t len,
+    unsigned int flags, void *userdata)
+{
+    // flags |= SPLICE_F_NONBLOCK;
+    return splice(*iofd, offin, iopipe->pipefd[1], offout, len, 0);
+}
+
+static ssize_t custom_splice_send(
+    int fdin, off_t *offin,
+    int fdout, off_t *offout, size_t len,
+    unsigned int flags, void *userdata)
+{
+    return splice(iopipe->pipefd[0], offin, *iofd, offout, len, flags);
+}
 
 class SyncSessionLoop : public FuseSessionLoop {
 public:
@@ -264,8 +277,8 @@ public:
         const struct fuse_custom_io custom_io = {
             .writev = photon::fs::custom_writev,
 	        .read = photon::fs::custom_read,
-	        .splice_receive = NULL,
-	        .splice_send = NULL,
+	        .splice_receive = photon::fs::custom_splice_receive,
+	        .splice_send = photon::fs::custom_splice_send,
 #if FUSE_USE_VERSION >= FUSE_MAKE_VERSION(3, 17)
         	.clone_fd = NULL,
 #endif
@@ -344,6 +357,8 @@ private:
             .mem = NULL,
         };
 
+        (*iopipe).setup();
+        DEFER((*iopipe).setdown());
         sem_.wait(1);
         idlers_.erase(wrk_id);
         while(!fuse_session_exited(se_)) {
