@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #include "session_loop.h"
-#include "fuse_pipe.h"
+#include "fuse-compat.h"
+
 
 #if FUSE_USE_VERSION >= 30
 #include <fuse3/fuse_lowlevel.h>
@@ -51,6 +52,7 @@ namespace fs {
 
 class EPollSessionLoop : public FuseSessionLoop {
 private:
+    loop_args args_;
     struct fuse_session *se;
 #if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 0)
     struct fuse_chan *ch;
@@ -166,7 +168,8 @@ public:
           loop(new_event_loop({this, &EPollSessionLoop::wait_for_readable},
                               {this, &EPollSessionLoop::on_accept})) {}
 
-    int init() {
+    int init(const loop_args &args) {
+        args_ = args;
 #if FUSE_USE_VERSION < FUSE_MAKE_VERSION(3, 0)
         auto ch = fuse_session_next_chan(se, NULL);
         auto fd = fuse_chan_fd(ch);
@@ -192,8 +195,8 @@ public:
     void run() { loop->run(); }
 };
 
-FuseSessionLoop* new_epoll_session_loop(struct fuse_session *se) {
-    return NewObj<EPollSessionLoop>(se)->init();
+FuseSessionLoop* new_epoll_session_loop(struct fuse_session *se, loop_args args) {
+    return NewObj<EPollSessionLoop>(se)->init(args);
 }
 
 
@@ -237,8 +240,13 @@ static ssize_t custom_splice_send(
 
 class SyncSessionLoop : public FuseSessionLoop {
 public:
-    int init() {
+    int init(const loop_args &args) {
+        args_ = args;
         set_fd();
+        max_workers_ = args_.max_threads;
+        if (max_workers_ <= 0)
+            max_workers_ = 32;
+
         for (int i = 0; i < max_workers_; ++i) {
             auto th = photon::thread_create11(
                 &SyncSessionLoop::fuse_do_work, this, i);
@@ -293,6 +301,7 @@ public:
     }
 
 private:
+    loop_args args_;
     struct fuse_session *se_;
     int blk_fd_;
     int nonblk_fd_;
@@ -347,24 +356,30 @@ private:
         fcntl(noblk_fd, F_SETFL, (flags | O_NONBLOCK));
         nonblk_fd_ = noblk_fd;
 
-        LOG_INFO("masterfd:`", masterfd, " block fd `", blk_fd_, "  nonblock fd: `", nonblk_fd_);
+        LOG_INFO("masterfd:`", masterfd,
+                 " block fd `", blk_fd_,
+                 "  nonblock fd: `", nonblk_fd_);
         return 0;
     }
 
     void *fuse_do_work(int id) {
+        int res;
         auto wrk_id = id;
         struct fuse_buf fbuf = {
             .mem = NULL,
         };
 
-        (*iopipe).setup();
-        DEFER((*iopipe).setdown());
+        if (args_.force_splice_read)
+            (*iopipe).setup();
         sem_.wait(1);
         idlers_.erase(wrk_id);
         while(!fuse_session_exited(se_)) {
             if (idlers_.size() == (workers_.size() - 1)) {
                 *iofd = blk_fd_;
-                int res = fuse_session_receive_buf(se_, &fbuf);
+                if (args_.force_splice_read)
+                    res = fuse_session_receive_splice(se_, &fbuf, &*iopipe, *iofd);
+                else
+                    res = fuse_session_receive_fd(se_, &fbuf, *iofd);
                 if (res <= 0) {
                     break;
                 }
@@ -376,7 +391,10 @@ private:
                 fuse_session_process_buf(se_, &fbuf);
             } else {
                 *iofd = nonblk_fd_;
-                int res = fuse_session_receive_buf(se_, &fbuf);
+                if (args_.force_splice_read)
+                    res = fuse_session_receive_splice(se_, &fbuf, &*iopipe, *iofd);
+                else
+                    res = fuse_session_receive_fd(se_, &fbuf, *iofd);
                 if (res < 0) {
                     if (res != -EWOULDBLOCK || res != -EAGAIN) {
                         break;
@@ -408,6 +426,8 @@ private:
             }
         }
 
+        if (args_.force_splice_read)
+            (*iopipe).setdown();
         for (const auto& wrk : idlers_) {
             photon::thread_interrupt(workers_[wrk]);
         }
@@ -415,8 +435,8 @@ private:
     }
 };
 
-FuseSessionLoop *new_sync_session_loop(struct fuse_session *se) {
-    return NewObj<SyncSessionLoop>(se)->init();
+FuseSessionLoop *new_sync_session_loop(struct fuse_session *se, loop_args args) {
+    return NewObj<SyncSessionLoop>(se)->init(args);
 }
 
 int set_sync_custom_io(struct fuse_session *se) {
@@ -451,8 +471,12 @@ public:
         delete io_engine_;
     }
 
-    int init() {
+    int init(const loop_args &args) {
+        args_ = args;
         set_fd();
+        max_workers_ = args.max_threads;
+        if (max_workers_ <= 0)
+            max_workers_ = 32;
         for (int i = 0; i < max_workers_; ++i) {
             auto th = photon::thread_create11(
                 &IouringSessionLoop::fuse_do_work, this);
@@ -493,6 +517,7 @@ public:
     static thread_local int io_fd;
 
 private:
+    loop_args args_;
     struct fuse_session *se_;
     int max_workers_;
     std::vector<photon::thread *> workers_;
@@ -589,8 +614,8 @@ ssize_t custom_iou_read(int fd, void *buf, size_t len, void *userdata)
     return ret;
 }
 
-FuseSessionLoop *new_iouring_session_loop(struct fuse_session *se) {
-    return NewObj<IouringSessionLoop>(se)->init();
+FuseSessionLoop *new_iouring_session_loop(struct fuse_session *se, loop_args args) {
+    return NewObj<IouringSessionLoop>(se)->init(args);
 }
 
 int set_iouring_custom_io(struct fuse_session *se) {
