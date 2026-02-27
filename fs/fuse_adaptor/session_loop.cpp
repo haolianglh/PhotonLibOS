@@ -474,6 +474,21 @@ static ssize_t custom_splice_send(
     return splice(iopipe->pipefd[0], offin, *iofd, offout, len, flags);
 }
 
+
+#define FUSE_DEV_IOC_BIND_IQUEUE _IOW(229, 209, uint32_t)
+
+int bind_iqueue(int fd, int qid) {
+    int res;
+    res = ioctl(fd, FUSE_DEV_IOC_BIND_IQUEUE, &qid);
+    if (res == -1) {
+        LOG_ERROR("failed to bind iq, fd: %d, qid: %d: %s\n", fd, qid, strerror(errno));
+    }
+
+    return res;
+}
+
+static std::atomic<uint32_t> iqctr{0};
+
 class SyncSessionLoop : public FuseSessionLoop {
 public:
     int init(const loop_args &args) {
@@ -592,6 +607,9 @@ private:
         fcntl(noblk_fd, F_SETFL, (flags | O_NONBLOCK));
         nonblk_fd_ = noblk_fd;
 
+        uint32_t qid = iqctr.fetch_add(1);
+        bind_iqueue(nonblk_fd_, qid);
+        bind_iqueue(blk_fd_, qid);
         LOG_INFO("masterfd:`", masterfd,
                  " block fd `", blk_fd_,
                  "  nonblock fd: `", nonblk_fd_);
